@@ -32,6 +32,8 @@ Three-layer compression pipeline so the agent can work forever:
                   Same as auto, triggered manually.
 
 Key insight: "The agent can forget strategically and keep working forever."
+
+Supports both Anthropic and Gemini APIs via common.py adapter.
 """
 
 import json
@@ -40,18 +42,9 @@ import subprocess
 import time
 from pathlib import Path
 
-from anthropic import Anthropic
-from dotenv import load_dotenv
-
-load_dotenv(override=True)
-
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+from common import LLM, convert_tools_to_openai_format, MODEL
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
-
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
 
 THRESHOLD = 50000
@@ -66,7 +59,6 @@ def estimate_tokens(messages: list) -> int:
 
 # -- Layer 1: micro_compact - replace old tool results with placeholders --
 def micro_compact(messages: list) -> list:
-    # Collect (msg_index, part_index, tool_result_dict) for all tool_result entries
     tool_results = []
     for msg_idx, msg in enumerate(messages):
         if msg["role"] == "user" and isinstance(msg.get("content"), list):
@@ -75,7 +67,6 @@ def micro_compact(messages: list) -> list:
                     tool_results.append((msg_idx, part_idx, part))
     if len(tool_results) <= KEEP_RECENT:
         return messages
-    # Find tool_name for each result by matching tool_use_id in prior assistant messages
     tool_name_map = {}
     for msg in messages:
         if msg["role"] == "assistant":
@@ -84,7 +75,6 @@ def micro_compact(messages: list) -> list:
                 for block in content:
                     if hasattr(block, "type") and block.type == "tool_use":
                         tool_name_map[block.id] = block.name
-    # Clear old results (keep last KEEP_RECENT)
     to_clear = tool_results[:-KEEP_RECENT]
     for _, _, result in to_clear:
         if isinstance(result.get("content"), str) and len(result["content"]) > 100:
@@ -96,29 +86,37 @@ def micro_compact(messages: list) -> list:
 
 # -- Layer 2: auto_compact - save transcript, summarize, replace messages --
 def auto_compact(messages: list) -> list:
-    # Save full transcript to disk
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
     with open(transcript_path, "w") as f:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
     print(f"[transcript saved: {transcript_path}]")
-    # Ask LLM to summarize
     conversation_text = json.dumps(messages, default=str)[:80000]
-    response = client.messages.create(
+    response = LLM.create(
         model=MODEL,
-        messages=[{"role": "user", "content":
-            "Summarize this conversation for continuity. Include: "
-            "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-            "Be concise but preserve critical details.\n\n" + conversation_text}],
+        messages=[
+            {
+                "role": "user",
+                "content": "Summarize this conversation for continuity. Include: "
+                "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+                "Be concise but preserve critical details.\n\n" + conversation_text,
+            }
+        ],
         max_tokens=2000,
     )
-    summary = response.content[0].text
-    # Replace all messages with compressed summary
+    summary = LLM.get_response_text(response)
     return [
-        {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
-        {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
+        {
+            "role": "user",
+            "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}",
+        },
+        {
+            "role": "assistant",
+            "content": "Understood. I have the context from the summary. Continuing.",
+        },
     ]
+
 
 
 # -- Tool implementations --
@@ -128,17 +126,25 @@ def safe_path(p: str) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, text=True, timeout=120)
+        r = subprocess.run(
+            command,
+            shell=True,
+            cwd=WORKDIR,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
         out = (r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
+
 
 def run_read(path: str, limit: int = None) -> str:
     try:
@@ -149,6 +155,7 @@ def run_read(path: str, limit: int = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
 def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
@@ -157,6 +164,7 @@ def run_write(path: str, content: str) -> str:
         return f"Wrote {len(content)} bytes"
     except Exception as e:
         return f"Error: {e}"
+
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
@@ -171,59 +179,109 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 TOOL_HANDLERS = {
-    "bash":       lambda **kw: run_bash(kw["command"]),
-    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "bash": lambda **kw: run_bash(kw["command"]),
+    "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "compact":    lambda **kw: "Manual compression requested.",
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "compact": lambda **kw: "Manual compression requested.",
 }
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "compact", "description": "Trigger manual conversation compression.",
-     "input_schema": {"type": "object", "properties": {"focus": {"type": "string", "description": "What to preserve in the summary"}}}},
+    {
+        "name": "bash",
+        "description": "Run a shell command.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Read file contents.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Write content to file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": "Replace exact text in file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+            },
+            "required": ["path", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "compact",
+        "description": "Trigger manual conversation compression.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "focus": {
+                    "type": "string",
+                    "description": "What to preserve in the summary",
+                }
+            },
+        },
+    },
 ]
 
 
 def agent_loop(messages: list):
+    tools = convert_tools_to_openai_format(TOOLS)
     while True:
-        # Layer 1: micro_compact before each LLM call
         micro_compact(messages)
-        # Layer 2: auto_compact if token estimate exceeds threshold
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+
+        response = LLM.create(
+            model=MODEL,
+            system=SYSTEM,
+            messages=messages,
+            tools=tools,
+            max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        if not LLM.is_tool_call(response):
+            messages.append({"role": "assistant", "content": response})
             return
+
+        messages.append({"role": "assistant", "content": response})
         results = []
         manual_compact = False
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "compact":
-                    manual_compact = True
-                    output = "Compressing..."
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    try:
-                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                    except Exception as e:
-                        output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
-        # Layer 3: manual compact triggered by the compact tool
+        for block in LLM.get_tool_calls(response):
+            name = LLM.get_tool_name(block)
+            args = LLM.get_tool_args(block)
+            if name == "compact":
+                manual_compact = True
+                output = "Compressing..."
+            else:
+                handler = TOOL_HANDLERS.get(name)
+                try:
+                    output = handler(**args) if handler else f"Unknown tool: {name}"
+                except Exception as e:
+                    output = f"Error: {e}"
+            print(f"> {name}: {str(output)[:200]}")
+            results.append(LLM.format_tool_result(block, str(output)))
+
+        messages.append({"role": "tool", "content": results})
+
         if manual_compact:
             print("[manual compact]")
             messages[:] = auto_compact(messages)
@@ -240,9 +298,5 @@ if __name__ == "__main__":
             break
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+        print(history[-1]["content"])
         print()

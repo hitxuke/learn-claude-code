@@ -37,17 +37,12 @@ import subprocess
 import time
 from pathlib import Path
 
-from anthropic import Anthropic
+from common import LLM, convert_tools_to_openai_format, MODEL
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
 
 
 def detect_repo_root(cwd: Path) -> Path | None:
@@ -79,7 +74,6 @@ SYSTEM = (
 )
 
 
-# -- EventBus: append-only lifecycle events for observability --
 class EventBus:
     def __init__(self, event_log_path: Path):
         self.path = event_log_path
@@ -118,7 +112,6 @@ class EventBus:
         return json.dumps(items, indent=2)
 
 
-# -- TaskManager: persistent task board with optional worktree binding --
 class TaskManager:
     def __init__(self, tasks_dir: Path):
         self.dir = tasks_dir
@@ -221,7 +214,6 @@ TASKS = TaskManager(REPO_ROOT / ".tasks")
 EVENTS = EventBus(REPO_ROOT / ".worktrees" / "events.jsonl")
 
 
-# -- WorktreeManager: create/list/run/remove git worktrees + lifecycle index --
 class WorktreeManager:
     def __init__(self, repo_root: Path, tasks: TaskManager, events: EventBus):
         self.repo_root = repo_root
@@ -391,7 +383,9 @@ class WorktreeManager:
         except subprocess.TimeoutExpired:
             return "Error: Timeout (300s)"
 
-    def remove(self, name: str, force: bool = False, complete_task: bool = False) -> str:
+    def remove(
+        self, name: str, force: bool = False, complete_task: bool = False
+    ) -> str:
         wt = self._find(name)
         if not wt:
             return f"Error: Unknown worktree '{name}'"
@@ -468,13 +462,14 @@ class WorktreeManager:
                 "status": "kept",
             },
         )
-        return json.dumps(kept, indent=2) if kept else f"Error: Unknown worktree '{name}'"
+        return (
+            json.dumps(kept, indent=2) if kept else f"Error: Unknown worktree '{name}'"
+        )
 
 
 WORKTREES = WorktreeManager(REPO_ROOT, TASKS, EVENTS)
 
 
-# -- Base tools (kept minimal, same style as previous sessions) --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -541,14 +536,22 @@ TOOL_HANDLERS = {
     "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
     "task_list": lambda **kw: TASKS.list_all(),
     "task_get": lambda **kw: TASKS.get(kw["task_id"]),
-    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("owner")),
-    "task_bind_worktree": lambda **kw: TASKS.bind_worktree(kw["task_id"], kw["worktree"], kw.get("owner", "")),
-    "worktree_create": lambda **kw: WORKTREES.create(kw["name"], kw.get("task_id"), kw.get("base_ref", "HEAD")),
+    "task_update": lambda **kw: TASKS.update(
+        kw["task_id"], kw.get("status"), kw.get("owner")
+    ),
+    "task_bind_worktree": lambda **kw: TASKS.bind_worktree(
+        kw["task_id"], kw["worktree"], kw.get("owner", "")
+    ),
+    "worktree_create": lambda **kw: WORKTREES.create(
+        kw["name"], kw.get("task_id"), kw.get("base_ref", "HEAD")
+    ),
     "worktree_list": lambda **kw: WORKTREES.list_all(),
     "worktree_status": lambda **kw: WORKTREES.status(kw["name"]),
     "worktree_run": lambda **kw: WORKTREES.run(kw["name"], kw["command"]),
     "worktree_keep": lambda **kw: WORKTREES.keep(kw["name"]),
-    "worktree_remove": lambda **kw: WORKTREES.remove(kw["name"], kw.get("force", False), kw.get("complete_task", False)),
+    "worktree_remove": lambda **kw: WORKTREES.remove(
+        kw["name"], kw.get("force", False), kw.get("complete_task", False)
+    ),
     "worktree_events": lambda **kw: EVENTS.list_recent(kw.get("limit", 20)),
 }
 
@@ -726,35 +729,31 @@ TOOLS = [
 ]
 
 
+
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
+        response = LLM.create(
             model=MODEL,
             system=SYSTEM,
             messages=messages,
-            tools=TOOLS,
+            tools=convert_tools_to_openai_format(TOOLS),
             max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        messages.append({"role": "assistant", "content": response})
+        if not LLM.is_tool_call(response):
             return
 
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": str(output),
-                    }
-                )
+        for block in LLM.get_tool_calls(response):
+            name = LLM.get_tool_name(block)
+            args = LLM.get_tool_args(block)
+            handler = TOOL_HANDLERS.get(name)
+            try:
+                output = handler(**args) if handler else f"Unknown tool: {name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {name}: {str(output)[:200]}")
+            results.append(LLM.format_tool_result(block, str(output)))
         messages.append({"role": "user", "content": results})
 
 
@@ -774,8 +773,7 @@ if __name__ == "__main__":
         history.append({"role": "user", "content": query})
         agent_loop(history)
         response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+        text = get_response_text(response_content)
+        if text:
+            print(text)
         print()

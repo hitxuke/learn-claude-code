@@ -236,7 +236,12 @@ def agent_loop(messages):
 git clone https://github.com/shareAI-lab/learn-claude-code
 cd learn-claude-code
 pip install -r requirements.txt
-cp .env.example .env   # .env を編集して ANTHROPIC_API_KEY を入力
+cp .env.example .env   # .env を編集して API キーを入力
+
+# サポートされている API:
+#   - Groq (推奨、免费ティアあり) - GEMINI_API_KEY + BASE_URL を設定
+#   - Gemini - GEMINI_API_KEY を設定
+#   - Anthropic - ANTHROPIC_API_KEY を設定
 
 python agents/s01_agent_loop.py       # ここから開始
 python agents/s12_worktree_task_isolation.py  # 全セッションの到達点

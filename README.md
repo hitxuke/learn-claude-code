@@ -235,7 +235,12 @@ Treat the team JSONL mailbox protocol in this repo as a teaching implementation,
 git clone https://github.com/shareAI-lab/learn-claude-code
 cd learn-claude-code
 pip install -r requirements.txt
-cp .env.example .env   # Edit .env with your ANTHROPIC_API_KEY
+cp .env.example .env   # Edit .env with your API key
+
+# Supported APIs:
+#   - Groq (recommended, free tier available) - set GEMINI_API_KEY + BASE_URL
+#   - Gemini - set GEMINI_API_KEY
+#   - Anthropic - set ANTHROPIC_API_KEY
 
 python agents/s01_agent_loop.py       # Start here
 python agents/s12_worktree_task_isolation.py  # Full progression endpoint
